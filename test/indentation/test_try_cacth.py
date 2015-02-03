@@ -1,7 +1,7 @@
-def foo_explode():
-    try:
+foo_explode():
+     try:
         f = open("nonexistent", 'r')
-     except:
+    except:
         f.close()
 
 foo_explode()

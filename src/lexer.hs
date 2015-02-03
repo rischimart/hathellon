@@ -1,6 +1,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 module Lexer where
 import           Control.Applicative           hiding (many, (<|>))
+import           Control.Concatenative
+import           Control.Monad.State           as St
 import           System.Environment
 import           Text.Parsec.Combinator
 import           Text.Parsec.Indent
@@ -8,7 +10,6 @@ import           Text.Parsec.Language          as Lang
 import           Text.Parsec.Prim              as Prm hiding (State)
 import           Text.Parsec.Token             as Tk
 import           Text.ParserCombinators.Parsec as Pasc
-
 
 keywords = [
   "False",      "class",      "finally",    "is",         "return",
@@ -53,6 +54,7 @@ idParser = Tk.parens pythonTokenLexer
 keywordParser = Tk.reserved pythonTokenLexer
 operatorParser = Tk.reservedOp pythonTokenLexer
 stringParser = Tk.stringLiteral pythonTokenLexer
+--naturalParer =
 
 data Token = Keyword String
            | Identifier String
@@ -68,34 +70,49 @@ data Token = Keyword String
 
 type IndParser a = IndentParser String () a
 
-data CodeSnippet = SingleLine String | Bloc String [CodeSnippet]
+data CodeSnippet = SingleLine [String] | Bloc [String] [CodeSnippet]
 
 instance Show CodeSnippet where
   show (SingleLine str) = "single " ++ show str
   show (Bloc header snippets) = "{" ++ (show header) ++ ":\n" ++ unlines (fmap show snippets) ++ "}"
 
-parseHead :: IndParser String
-parseHead = do
+parseSingleComment :: IndParser String
+parseSingleComment = do
   spaces
+  char '#'
+  manyTill (noneOf "\n\r") (oneOf "\n\r")
+
+
+
+parseHead :: IndParser [String]
+parseHead = do
   headerWord <- choice $ (Prm.try . string) <$> headerWords
-  skipMany space
+  spaces
   toks <- (many1 $ noneOf "\n\r :")  `sepBy` spaces
-  char ':' <* (many1 $ oneOf "\n\r")
-  return $ unwords (headerWord : toks)
+  char ':'
+  skipMany $ oneOf "\n\r \t"
+  return (headerWord : toks)
+
+
+checkBlockIndent :: (Stream s (St.State SourcePos) z) => IndentParser s u ()
+checkBlockIndent = do
+    s <- get
+    p <- getPosition
+    if biAp sourceColumn (==) p s then parserFail "block not indented" else return ()
 
 
 parseLineInBlock :: IndParser CodeSnippet
 parseLineInBlock = do
   many $ oneOf "\n\r"
-  spaces
+  notFollowedBy spaces
   line <- many1 $ noneOf "\n\r"
   many1 $ oneOf "\n\r"  <* spaces
-  return $ SingleLine line
+  return $ SingleLine $ words line
 
 parseBlock :: IndParser CodeSnippet
 parseBlock = do
   header <- parseHead
-  spaces
+  checkBlockIndent
   body <- block $ parseBlock <|> parseLineInBlock
   return $ Bloc header body
 
