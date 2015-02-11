@@ -45,9 +45,10 @@ data Statement = Assignment Expression Expression
 data Expression = Binop Operator Expression Expression
                 | Name String
                 | Number Numeral
+                | StrLiteral String
                 deriving (Show)
 
-data Operator = Add | Sub | Mul | Div | And | Or deriving (Show)
+data Operator = Add | Sub | Mul | Div | And | Or | Eq | Ne | Gt | Lt | Ge | Le deriving (Show)
 
 data Numeral = Integ Integer
              | Flt  Float
@@ -61,24 +62,24 @@ data  = Binop String ASTNode ASTNode
              | Unary String ASTNode
              | Assign ASTNode ASTNode
 --}
-data Val = Str String
-         | Id String
+data Val = Id String
          | Decimal Float
          | Intgr Integer
-         | Bool String
+         | Boolean Bool
+         | Str String
          | None
-         | Function [String]
+         -- Function Env String Statements
          | Void
          | NotFound String   --identifier not found
-           deriving (Eq)
+           deriving (Eq, Ord)
+  
 
 instance Show Val where
   show (Str str) = str
   show (Id str)  = str
   show (Decimal f) = show f
   show (Intgr i) = show i
-  show (Bool "T") = "True"
-  show (Bool "F") = "False"
+  show (Boolean b) = show b
   show None = "None"
   show _    = "not implemented"
 
@@ -88,20 +89,6 @@ type EvalResult = StateT Env (ErrorT String IO)
 envUpdate :: String -> Val -> Env -> Env
 envUpdate var val env = M.insert var val env
 
-compatibleValType :: Val -> Val -> Bool
-compatibleValType val1 val2 = case (val1, val2) of
-  (Str _, Str _) -> True
-  (Intgr _, Intgr _) -> True
-  (Decimal _, Decimal _) -> True
-  (Intgr _, Decimal _) -> True
-  (Decimal _, Intgr _) -> True
---  (Digits _, Bool _) -> True
-  (None, _     ) -> False
-  (Function _ , _) -> False
-  (Void, _) -> False
-  _         -> False
-  
-  
 
 evalExpr :: Expression -> EvalResult Val
 evalExpr (Name identifier) = do
@@ -115,38 +102,72 @@ evalExpr (Number n) = do
   case n of
    Integ i -> return $ Intgr i
    Flt   f -> return $ Decimal f
+
+evalExpr (StrLiteral s) = do
+  return $ Str s
   
 evalExpr (Binop op left right) = do
   lRes <- evalExpr left
   rRes <- evalExpr right
   case (lRes,rRes) of
-   (NotFound l, _) -> throwError $ "Not in scope: " <> l
-   (_, NotFound r) -> throwError $ "Not in scope: " <> r
-   (_, _)          -> 
-     if (compatibleValType lRes rRes)
-     then doBinop op lRes rRes
-     else throwError $ "Incompatible types: " <> show lRes <> " and " <> show rRes
-         where
-           doBinop Add (Str l) (Str r) = return $ Str $ l <> r
-           doBinop Add (Intgr l) (Intgr r) = return $ Intgr $ l + r
-           doBinop Add (Decimal l) (Intgr r) = return $ Decimal $ l + (fromInteger r)
-           doBinop Add (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) + r
+   (NotFound l, _) -> throwError $ "NameError : name " <> l <> " is not defined"
+   (_, NotFound r) -> throwError $ "NameError : name " <> r <> " is not defined"
+   (_, _)          -> doBinop op lRes rRes
+     where
+       compatibleValType :: Val -> Val -> Bool
+       compatibleValType val1 val2 = case (val1, val2) of
+         (Str _, Str _) -> True
+         (Intgr _, Intgr _) -> True
+         (Decimal _, Decimal _) -> True
+         (Intgr _ , Decimal _) -> True
+         (Decimal _, Intgr _)  -> True
+         (None, None)  -> True
+         (Void, Void) -> True
+         (Boolean _, Boolean _) -> True
+         _         -> False
+  
+       doBinop Add (Str l) (Str r) = return $ Str $ l <> r
+       doBinop Add (Intgr l) (Intgr r) = return $ Intgr $ l + r
+       doBinop Add (Decimal l) (Intgr r) = return $ Decimal $ l + (fromInteger r)
+       doBinop Add (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) + r
 
-           doBinop Sub (Intgr l) (Intgr r) = return $ Intgr $ l - r
-           doBinop Sub (Decimal l) (Intgr r) = return $ Decimal $ l - (fromInteger r)
-           doBinop Sub (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) - r
+       doBinop Sub (Intgr l) (Intgr r) = return $ Intgr $ l - r
+       doBinop Sub (Decimal l) (Intgr r) = return $ Decimal $ l - (fromInteger r)
+       doBinop Sub (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) - r
 
-           doBinop Mul (Intgr l) (Intgr r) = return $ Intgr $ l * r
-           doBinop Mul (Decimal l) (Intgr r) = return $ Decimal $ l * (fromInteger r)
-           doBinop Mul (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) * r
+       doBinop Mul (Intgr l) (Intgr r) = return $ Intgr $ l * r
+       doBinop Mul (Decimal l) (Intgr r) = return $ Decimal $ l * (fromInteger r)
+       doBinop Mul (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) * r
+       doBinop Mul (Intgr l) (Str s)     = return $ Str $ concat $ replicate (fromInteger l) s
+       doBinop Mul str@(Str _) int@(Intgr _)     = doBinop Mul int str 
            
-           doBinop Div (Intgr l) (Intgr r) = return $ Intgr $ l `div` r
-           doBinop Div (Decimal l) (Intgr r) = return $ Decimal $ l / (fromInteger r)
-           doBinop Div (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) / r
+       doBinop Div (Intgr l) (Intgr r) = return $ Intgr $ l `div` r
+       doBinop Div (Decimal l) (Intgr r) = return $ Decimal $ l / (fromInteger r)
+       doBinop Div (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) / r
 
+       doBinop Eq  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) == r
+       doBinop Eq  (Decimal l) (Intgr r) = return $ Boolean $ l == (fromInteger r)
+       doBinop Eq  left right  = return $ Boolean $ left == right
+       doBinop Ne  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) /= r
+       doBinop Ne  (Decimal l) (Intgr r) = return $ Boolean $ l /= (fromInteger r)
+       doBinop Ne  left right  = return $ Boolean $ left /= right
+       
+         
+       doBinop Gt  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) > r
+       doBinop Gt  (Decimal l) (Intgr r) = return $ Boolean $ l > (fromInteger r)
+       doBinop Gt  left        right     = return $ Boolean $ left > right
+       doBinop Lt  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) < r
+       doBinop Lt  (Decimal l) (Intgr r) = return $ Boolean $ l < (fromInteger r)
+       doBinop Lt  left        right     = return $ Boolean $ left < right
+       doBinop Le  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) <= r
+       doBinop Le  (Decimal l) (Intgr r) = return $ Boolean $ l <= (fromInteger r)
+       doBinop Le  left        right     = return $ Boolean $ left < right
 
-           doBinop _     _           _     = throwError "Invalid types for binop!"
+       doBinop Ge  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) >= r
+       doBinop Ge  (Decimal l) (Intgr r) = return $ Boolean $ l >= (fromInteger r)
+       doBinop Ge  left        right     = return $ Boolean $ left >= right
 
+       doBinop _     _           _     = throwError $ "TypeError: Unsupported operand types(s) for " <> show op <> show lRes <> " and " <> show rRes
 
 evalStatements :: Statements -> EvalResult Val
 evalStatements stmts = do
@@ -175,21 +196,30 @@ evalStatement (If ifTest stmtGroups) = case stmtGroups of
     ifRes <- evalExpr ifTest
     case ifRes of
      None -> if not (Prelude.null xs) then evalStatements (head xs) else return Void
-     Bool "F" -> if not (Prelude.null xs) then evalStatements (head xs) else return Void
+     Boolean False -> if not (Prelude.null xs) then evalStatements (head xs) else return Void
      _ ->  evalStatements x
 
 evalStatement (Print expr) = do
   contents <- evalExpr expr
   case contents of
-   NotFound name -> throwError $ "identifier " <> name <> " not found!"
+   NotFound name -> throwError $ "NameError: name " <> name <> " is not defined!"
    _             -> do
                     liftIO $ print contents
                     return Void
   
-
-
 program :: Statements
-program = [Assignment (Name "a") (Number $ Integ 1), Assignment (Name "b") (Number $ Integ 3), Print $ Binop Add (Name "a") (Name "b"), Print $ Binop Div (Name "a") (Name "c"), Print $ Name "a", Assignment (Name "b") (Number $ Flt 1.5), Print $ Name "b"]
+program = [Assignment (Name "a") (Number $ Integ 5),
+           Assignment (Name "b") (Number $ Flt 2.0),
+           If (Binop Eq (Name "a") (Name "b"))
+              [[Print $ StrLiteral "equal"],
+               [If (Binop Ge (Name "a") (Number $ Integ 2))
+                   [[Assignment (Name "c") (Binop Add (Name "a") (Name "b")),
+                     Print $ Name "c"],
+                    [If (Binop Eq (Name "b") (Number $ Flt 2.0))
+                       [[Assignment (Name "d") (Binop Div (Name "a") (Name "b")),
+                         Print $ Binop Sub (Name "d") (Name "a")],
+
+                        [Print $ StrLiteral "blah"]]]]]]]
 
 
 interpret :: Env -> EvalResult Val -> IO (Either String (Val, Env))
