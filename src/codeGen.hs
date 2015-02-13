@@ -26,8 +26,10 @@ import Control.Monad.Reader
 import Control.Monad.Error
 import Control.Monad.Identity
 import Control.Monad.Trans.State.Lazy
+import Control.Monad.Trans.Either
 import Control.Applicative
 import Prelude
+import Debug.Trace
 --import Data.Traversable
 type Statements = [Statement]
 type Expressions = [Expression]
@@ -40,9 +42,12 @@ data Statement = Assignment Expression Expression
                | While Expression Statements
                | For Expressions Expressions Statements
                | Print Expression
+               | FunDef String [Argument] Statements
+
                deriving (Show)
 
 data Expression = Binop Operator Expression Expression
+                | FunApp String [Expression]
                 | Name String
                 | Number Numeral
                 | StrLiteral String
@@ -62,17 +67,46 @@ data  = Binop String ASTNode ASTNode
              | Unary String ASTNode
              | Assign ASTNode ASTNode
 --}
+
+data Argument = Identifier String
+              | Default Expression Expression
+              | Vararg
+              | Kwargs
+                deriving (Show)
+
 data Val = Id String
          | Decimal Float
          | Intgr Integer
          | Boolean Bool
          | Str String
          | None
-         -- Function Env String Statements
+         | Function Env String [Argument] Statements
          | Void
          | NotFound String   --identifier not found
-           deriving (Eq, Ord)
+         | Ret Val
+         | Brk
+
+instance Eq Val where
+  (Intgr i)  == (Intgr j) = i == j
+  (Decimal f) == (Decimal g) = f == g
+  (Decimal f) == (Intgr i) = f == (fromInteger i)
+  (Intgr i) == (Decimal f) = (fromInteger i) == f
+  (Str s1)  ==  (Str s2)   = s1 == s2
+  (Boolean b1) == (Boolean b2)  = b1 == b2
+  None      == None       = True
+  (==) _ _                = False                        
   
+instance Ord Val where
+  (Intgr i)  < (Intgr j) = i < j
+  (Decimal f) < (Decimal g) = f < g
+  (Decimal f) < (Intgr i) = f < (fromInteger i)
+  (Intgr i) < (Decimal f) = (fromInteger i) < f
+  (Str s1)  <  (Str s2)   = s1 < s2
+  (Boolean b1) < (Boolean b2) = b1 < b2
+  (Str _)  <  (Decimal _) = False
+  (Str _) <   (Intgr _)   = False
+  (<) _ _                 = False
+
 
 instance Show Val where
   show (Str str) = str
@@ -81,6 +115,7 @@ instance Show Val where
   show (Intgr i) = show i
   show (Boolean b) = show b
   show None = "None"
+  show (Ret v) = show v
   show _    = "not implemented"
 
 type Env = M.HashMap String Val
@@ -89,10 +124,14 @@ type EvalResult = StateT Env (ErrorT String IO)
 envUpdate :: String -> Val -> Env -> Env
 envUpdate var val env = M.insert var val env
 
+nameError :: String -> String
+nameError name = "name " <> "' " <> name <> " '" <> " is not defined"
+
+makeErrorMsg :: String -> String -> String
+makeErrorMsg t err = t <> ": " <> err
 
 evalExpr :: Expression -> EvalResult Val
 evalExpr (Name identifier) = do
- 
   env <- get
   case M.lookup identifier env of
    Just val -> return val
@@ -105,7 +144,47 @@ evalExpr (Number n) = do
 
 evalExpr (StrLiteral s) = do
   return $ Str s
-  
+
+
+evalExpr (FunApp funName args) = do
+  env <- get
+  case M.lookup funName env of
+   Just (Function defenv name args' body) -> do
+     let expectedLen = length args'
+         givenLen = length args
+     if expectedLen /= givenLen
+       then let err = funName <> " takes exactly " <>
+                      show expectedLen <> "arguments (" <>
+                      show givenLen <> " given)"
+            in throwError $ makeErrorMsg "TypeError" err
+       else do
+         vals <- mapM evalExpr args
+         traceM $ "the vals of args are: " <> show vals
+         let unpackedargs = Prelude.foldr evalArg [] args'
+         defaults <- foldM evalDefaults M.empty args'
+         let localEnv = (M.fromList (zip unpackedargs vals) `M.union`
+                         defaults) `M.union` env
+         put localEnv
+         appVal <- evalStatements body
+         traceM "evaluation done"
+         traceM ("the value of " <> show funName <> " is: " <> show appVal)
+         put env
+         return appVal
+           where
+             evalArg (Identifier n) lst = n : lst 
+             evalArg   _            lst = lst
+      
+             evalDefaults e (Default left right) = do
+               l <- evalExpr left
+               r <- evalExpr right
+               case l of
+                NotFound var -> return $ envUpdate var r e
+                Id  var -> return $ envUpdate var r e
+                _ ->  return e
+             evalDefaults e _ = return e
+    
+   _  -> throwError $ nameError funName
+
 evalExpr (Binop op left right) = do
   lRes <- evalExpr left
   rRes <- evalExpr right
@@ -145,39 +224,34 @@ evalExpr (Binop op left right) = do
        doBinop Div (Decimal l) (Intgr r) = return $ Decimal $ l / (fromInteger r)
        doBinop Div (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) / r
 
-       doBinop Eq  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) == r
-       doBinop Eq  (Decimal l) (Intgr r) = return $ Boolean $ l == (fromInteger r)
-       doBinop Eq  left right  = return $ Boolean $ left == right
-       doBinop Ne  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) /= r
-       doBinop Ne  (Decimal l) (Intgr r) = return $ Boolean $ l /= (fromInteger r)
-       doBinop Ne  left right  = return $ Boolean $ left /= right
+
+       doBinop Eq l r = return $ Boolean $ l == r
+       doBinop Ne l r = return $ Boolean $ l /= r
        
-         
-       doBinop Gt  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) > r
-       doBinop Gt  (Decimal l) (Intgr r) = return $ Boolean $ l > (fromInteger r)
-       doBinop Gt  left        right     = return $ Boolean $ left > right
-       doBinop Lt  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) < r
-       doBinop Lt  (Decimal l) (Intgr r) = return $ Boolean $ l < (fromInteger r)
-       doBinop Lt  left        right     = return $ Boolean $ left < right
-       doBinop Le  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) <= r
-       doBinop Le  (Decimal l) (Intgr r) = return $ Boolean $ l <= (fromInteger r)
-       doBinop Le  left        right     = return $ Boolean $ left < right
+       doBinop Gt l r = return $ Boolean $ l > r
+       doBinop Lt l r = return $ Boolean $ l < r
+       doBinop Le l r = return $ Boolean $ l < r
+       doBinop Ge l r = return $ Boolean $ l >= r
 
-       doBinop Ge  (Intgr l) (Decimal r) = return $ Boolean $ (fromInteger l) >= r
-       doBinop Ge  (Decimal l) (Intgr r) = return $ Boolean $ l >= (fromInteger r)
-       doBinop Ge  left        right     = return $ Boolean $ left >= right
-
-       doBinop _     _           _     = throwError $ "TypeError: Unsupported operand types(s) for " <> show op <> show lRes <> " and " <> show rRes
+       doBinop _  _ _ = throwError $ "TypeError: Unsupported operand types(s) for " <> show op <> show lRes <> " and " <> show rRes
 
 evalStatements :: Statements -> EvalResult Val
 evalStatements stmts = do
-  mapM_ evalStatement stmts
-  return Void
-
+  rest <- liftM (dropWhile (not . shouldExit)) $ mapM evalStatement stmts
+  case rest of
+   [] -> return Void
+   x:_ -> do
+     traceM ("the value of  is: " <> show x)
+     return x
+  where
+    shouldExit :: Val -> Bool
+    shouldExit (Ret _) = True
+    shouldExit Brk     = True
+    shouldExit _       = False
 
 evalStatement :: Statement -> EvalResult Val
 evalStatement (Assignment left right) = do
-  lval <-  evalLeft left
+  lval <- evalLeft left
   rval <- evalExpr right
   env <- get
   case lval of
@@ -190,6 +264,17 @@ evalStatement (Assignment left right) = do
      evalLeft (Name identifier) = return $ Id identifier
      evalLeft _                 = throwError "Invalid left side of an assignment!"
 
+
+evalStatement (FunDef name args body) = do
+  env <- get
+  put $ envUpdate name (Function env name args body) env
+  return Void
+
+         
+evalStatement (Return expr) = do
+  val <- evalExpr expr
+  return $ Ret val
+  
 evalStatement (If ifTest stmtGroups) = case stmtGroups of
   [] -> throwError "Empty if!"
   (x:xs) -> do
@@ -208,18 +293,14 @@ evalStatement (Print expr) = do
                     return Void
   
 program :: Statements
-program = [Assignment (Name "a") (Number $ Integ 5),
-           Assignment (Name "b") (Number $ Flt 2.0),
-           If (Binop Eq (Name "a") (Name "b"))
-              [[Print $ StrLiteral "equal"],
-               [If (Binop Ge (Name "a") (Number $ Integ 2))
-                   [[Assignment (Name "c") (Binop Add (Name "a") (Name "b")),
-                     Print $ Name "c"],
-                    [If (Binop Eq (Name "b") (Number $ Flt 2.0))
-                       [[Assignment (Name "d") (Binop Div (Name "a") (Name "b")),
-                         Print $ Binop Sub (Name "d") (Name "a")],
-
-                        [Print $ StrLiteral "blah"]]]]]]]
+program = [FunDef "fib" [Identifier "n"]
+                        [If (Binop Le (Name "n") (Number $ Integ 0))
+                            [[Return $ Number $ Integ 1]],
+                         If (Binop Eq (Name "n") (Number $ Integ 1))
+                            [[Return $ Number $ Integ 2]],
+                         Return $ Binop Add (FunApp "fib" [Binop Sub (Name "n") (Number $ Integ 2)]) (FunApp "fib" [Binop Sub (Name "n") (Number $ Integ 1)])],
+                         
+           Print $ FunApp "fib" [Number $ Integ 3]]
 
 
 interpret :: Env -> EvalResult Val -> IO (Either String (Val, Env))
@@ -230,39 +311,3 @@ main = do
    Right _ -> return ()
    Left err -> print err
   
---evalStatement (Name str) = return $ Str str
-
-{--
-if test:
-  blahblah
-elif test2:
-  yadayada
-elif test3:
-  boooo
-else:
-  yayyyy
-
-If test 
---}
-
-{--
-if test:
-  blahblah
-else:
-  if test2:
-    yadayada
-  else:
-    if test3:
-       booo
-    else:
-       yayyy
--}
-     
-
---eval (InParens node) = "(" <> (codeGen node) <> ")"
---eval (Unary op node) = op <> (codeGen node)
-
-
--- b / (c + d)                         
---example = Binop "/" (Terminal "b") $ InParens $ Binop "+" (Terminal "c") (Terminal "d")
-
