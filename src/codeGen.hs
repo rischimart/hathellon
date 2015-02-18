@@ -26,7 +26,8 @@ import Control.Monad.Reader
 import Control.Monad.Error
 import Control.Monad.Identity
 import Control.Monad.Trans.State.Lazy
-import Control.Monad.Trans.Either
+--import Control.Monad.Trans.Either
+import Control.Monad.Cont
 import Control.Applicative
 import Prelude
 import Debug.Trace
@@ -94,7 +95,7 @@ instance Eq Val where
   (Str s1)  ==  (Str s2)   = s1 == s2
   (Boolean b1) == (Boolean b2)  = b1 == b2
   None      == None       = True
-  (==) _ _                = False                        
+  _   ==  _               = False                        
   
 instance Ord Val where
   (Intgr i)  < (Intgr j) = i < j
@@ -105,8 +106,9 @@ instance Ord Val where
   (Boolean b1) < (Boolean b2) = b1 < b2
   (Str _)  <  (Decimal _) = False
   (Str _) <   (Intgr _)   = False
-  (<) _ _                 = False
-
+  _       <    _          = False
+  left   <=   right      = left < right || left == right
+  left   >=   right      = left > right || left == right
 
 instance Show Val where
   show (Str str) = str
@@ -116,10 +118,10 @@ instance Show Val where
   show (Boolean b) = show b
   show None = "None"
   show (Ret v) = show v
-  show _    = "not implemented"
+  show Void    = "Void"
 
 type Env = M.HashMap String Val
-type EvalResult = StateT Env (ErrorT String IO)
+type EvalResult a = ContT a (StateT Env (ErrorT String IO)) a
 
 envUpdate :: String -> Val -> Env -> Env
 envUpdate var val env = M.insert var val env
@@ -132,7 +134,7 @@ makeErrorMsg t err = t <> ": " <> err
 
 evalExpr :: Expression -> EvalResult Val
 evalExpr (Name identifier) = do
-  env <- get
+  env <- lift get
   case M.lookup identifier env of
    Just val -> return val
    _        -> return $ NotFound identifier
@@ -147,7 +149,7 @@ evalExpr (StrLiteral s) = do
 
 
 evalExpr (FunApp funName args) = do
-  env <- get
+  env <- lift get
   case M.lookup funName env of
    Just (Function defenv name args' body) -> do
      let expectedLen = length args'
@@ -156,7 +158,7 @@ evalExpr (FunApp funName args) = do
        then let err = funName <> " takes exactly " <>
                       show expectedLen <> "arguments (" <>
                       show givenLen <> " given)"
-            in throwError $ makeErrorMsg "TypeError" err
+            in lift $ throwError $ makeErrorMsg "TypeError" err
        else do
          vals <- mapM evalExpr args
          traceM $ "the vals of args are: " <> show vals
@@ -164,11 +166,11 @@ evalExpr (FunApp funName args) = do
          defaults <- foldM evalDefaults M.empty args'
          let localEnv = (M.fromList (zip unpackedargs vals) `M.union`
                          defaults) `M.union` env
-         put localEnv
+         lift $ put localEnv
          appVal <- evalStatements body
          traceM "evaluation done"
          traceM ("the value of " <> show funName <> " is: " <> show appVal)
-         put env
+         lift $ put env
          return appVal
            where
              evalArg (Identifier n) lst = n : lst 
@@ -183,16 +185,19 @@ evalExpr (FunApp funName args) = do
                 _ ->  return e
              evalDefaults e _ = return e
     
-   _  -> throwError $ nameError funName
+   _  -> lift $ throwError $ nameError funName
 
 evalExpr (Binop op left right) = do
   lRes <- evalExpr left
   rRes <- evalExpr right
   case (lRes,rRes) of
-   (NotFound l, _) -> throwError $ "NameError : name " <> l <> " is not defined"
-   (_, NotFound r) -> throwError $ "NameError : name " <> r <> " is not defined"
+   (NotFound l, _) -> lift $ throwError $ "NameError : name " <> l <> " is not defined"
+   (_, NotFound r) -> lift $ throwError $ "NameError : name " <> r <> " is not defined"
+   (Ret l, Ret r) -> doBinop op l r
+   (Ret l, rhs)   -> doBinop op l rhs
+   (lhs, Ret r)  -> doBinop op lhs r
    (_, _)          -> doBinop op lRes rRes
-     where
+  where
        compatibleValType :: Val -> Val -> Bool
        compatibleValType val1 val2 = case (val1, val2) of
          (Str _, Str _) -> True
@@ -229,21 +234,38 @@ evalExpr (Binop op left right) = do
        doBinop Ne l r = return $ Boolean $ l /= r
        
        doBinop Gt l r = return $ Boolean $ l > r
-       doBinop Lt l r = return $ Boolean $ l < r
-       doBinop Le l r = return $ Boolean $ l < r
+       doBinop Lt l r = return $ Boolean $ l <= r
+       doBinop Le l r = return $ Boolean $ l <= r
        doBinop Ge l r = return $ Boolean $ l >= r
 
-       doBinop _  _ _ = throwError $ "TypeError: Unsupported operand types(s) for " <> show op <> show lRes <> " and " <> show rRes
+       doBinop o l r = lift $ throwError $ "TypeError: Unsupported operand types(s) for " <> show o <> ": " <> show l <> " and " <> show r
 
 evalStatements :: Statements -> EvalResult Val
 evalStatements stmts = do
-  rest <- liftM (dropWhile (not . shouldExit)) $ mapM evalStatement stmts
+  --mapM_ evalStatement stmts
+
+  results <- callCC $ \brk -> do
+                              forM stmts $ \stmt -> do
+                                res <- evalStatement stmt
+                                when (shouldExit res) $ brk [res]
+                                return res
+  case results of
+   (r@(Ret _) : []) -> return r
+   _  -> return Void
+
+
+  {--
+  rest <- (dropWhile (not . shouldExit)) <$> mapM evalStatement stmts
   case rest of
    [] -> return Void
    x:_ -> do
      traceM ("the value of  is: " <> show x)
      return x
+--}
   where
+    extract (Ret val) = val
+    extract _         = Void
+    
     shouldExit :: Val -> Bool
     shouldExit (Ret _) = True
     shouldExit Brk     = True
@@ -253,21 +275,21 @@ evalStatement :: Statement -> EvalResult Val
 evalStatement (Assignment left right) = do
   lval <- evalLeft left
   rval <- evalExpr right
-  env <- get
+  env <- lift get
   case lval of
    Id name -> do
-              put $ envUpdate name rval env
+              lift $ put $ envUpdate name rval env
               return Void
-   _       -> throwError "not defined!"
+   _       -> lift $ throwError "not defined!"
    where
      evalLeft :: Expression -> EvalResult Val
      evalLeft (Name identifier) = return $ Id identifier
-     evalLeft _                 = throwError "Invalid left side of an assignment!"
+     evalLeft _                 = lift $ throwError "Invalid left side of an assignment!"
 
 
 evalStatement (FunDef name args body) = do
-  env <- get
-  put $ envUpdate name (Function env name args body) env
+  env <- lift get
+  lift $ put $ envUpdate name (Function env name args body) env
   return Void
 
          
@@ -276,7 +298,7 @@ evalStatement (Return expr) = do
   return $ Ret val
   
 evalStatement (If ifTest stmtGroups) = case stmtGroups of
-  [] -> throwError "Empty if!"
+  [] -> lift $ throwError "Empty if!"
   (x:xs) -> do
     ifRes <- evalExpr ifTest
     case ifRes of
@@ -287,24 +309,50 @@ evalStatement (If ifTest stmtGroups) = case stmtGroups of
 evalStatement (Print expr) = do
   contents <- evalExpr expr
   case contents of
-   NotFound name -> throwError $ "NameError: name " <> name <> " is not defined!"
+   NotFound name -> lift $ throwError $ "NameError: name " <> name <> " is not defined!"
    _             -> do
                     liftIO $ print contents
                     return Void
   
 program :: Statements
+
 program = [FunDef "fib" [Identifier "n"]
                         [If (Binop Le (Name "n") (Number $ Integ 0))
                             [[Return $ Number $ Integ 1]],
                          If (Binop Eq (Name "n") (Number $ Integ 1))
-                            [[Return $ Number $ Integ 2]],
+                            [[Return $ Number $ Integ 1]],
                          Return $ Binop Add (FunApp "fib" [Binop Sub (Name "n") (Number $ Integ 2)]) (FunApp "fib" [Binop Sub (Name "n") (Number $ Integ 1)])],
                          
-           Print $ FunApp "fib" [Number $ Integ 3]]
+           Print $ FunApp "fib" [Number $ Integ 10]]
 
 
+program2 :: Statements
+program2 = [FunDef "test" [Identifier "n"]
+                          [If (Binop Eq (Name "n") (Number $ Integ 0))
+                            [[Return $ Number $ Integ 0]],
+                           Return $ Binop Add (Name "n") (FunApp "test" [Binop Sub (Name "n") (Number $ Integ 1)])],
+ 
+            Print $ FunApp "test" [Number $ Integ 10]]
+
+{--
+
+program = [Assignment (Name "a") (Number $ Integ 5),
+
+           Assignment (Name "b") (Number $ Flt 2.0),
+           If (Binop Eq (Name "a") (Name "b"))
+              [[Print $ StrLiteral "equal"],
+               [If (Binop Ge (Name "a") (Number $ Integ 2))
+                   [[Assignment (Name "c") (Binop Add (Name "a") (Name "b")),
+                     Print $ Name "c"],
+                    [If (Binop Eq (Name "b") (Number $ Flt 2.0))
+                       [[Assignment (Name "d") (Binop Div (Name "a") (Name "b")),
+                         Print $ Binop Sub (Name "d") (Name "a")],
+
+                        [Print $ StrLiteral "blah"]]]]]]]
+--}
+--type EvalResult = ContT () (StateT Env (ErrorT String IO))
 interpret :: Env -> EvalResult Val -> IO (Either String (Val, Env))
-interpret env res = runErrorT $ runStateT res env
+interpret env res = runErrorT $ runStateT (runContT res return) env
 main = do
   evalRes <- interpret M.empty (evalStatements program)
   case evalRes of
