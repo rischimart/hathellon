@@ -1,26 +1,6 @@
-{--
-expr: xor_expr ('|' xor_expr)*
-xor_expr: and_expr ('^' and_expr)*
-and_expr: shift_expr ('&' shift_expr)*
-shift_expr: arith_expr (('<<'|'>>') arith_expr)*
-arith_expr: term (('+'|'-') term)*
-term: factor (('*'|'/'|'%'|'//') factor)*
-factor: ('+'|'-'|'~') factor | power
-
-
-<Exp> ::= <Exp> + <Term> |
-    <Exp> - <Term> | 
-    <Term>
-
-<Term> ::= <Term> * <Factor> |
-    <Term> / <Factor> | 
-    <Factor>
-
-<Factor> ::= x | y | ... |
-    ( <Exp> ) | 
-    - <Factor> 
---}
 import Data.Monoid
+--import Data.Foldable
+import Data.Traversable (traverse, sequence, sequenceA)
 import Data.HashMap.Lazy as M
 import Control.Monad.Reader
 import Control.Monad.Error
@@ -41,7 +21,7 @@ data Statement = Assignment Expression Expression
                | Return Expression
                | If Expression [Statements]
                | While Expression Statements
-               | For Expressions Expressions Statements
+               | For Expression Expression Statements
                | Print Expression
                | FunDef String [Argument] Statements
 
@@ -52,22 +32,17 @@ data Expression = Binop Operator Expression Expression
                 | Name String
                 | Number Numeral
                 | StrLiteral String
+                | List [Expression]
+                | Tuple [Expression]
+                | Null
                 deriving (Show)
 
-data Operator = Add | Sub | Mul | Div | And | Or | Eq | Ne | Gt | Lt | Ge | Le deriving (Show)
+data Operator = Add | Sub | Mul | Div | Mod | And | Or | Eq | Ne | Gt | Lt | Ge | Le deriving (Show)
 
 data Numeral = Integ Integer
              | Flt  Float
                deriving (Show)
 
-
-{--
-data  = Binop String ASTNode ASTNode
-             | Terminal String
-             | InParens ASTNode
-             | Unary String ASTNode
-             | Assign ASTNode ASTNode
---}
 
 data Argument = Identifier String
               | Default Expression Expression
@@ -80,12 +55,14 @@ data Val = Id String
          | Intgr Integer
          | Boolean Bool
          | Str String
+         | Iterable {kind :: String, elements :: [Val]}
          | None
          | Function Env String [Argument] Statements
          | Void
-         | NotFound String   --identifier not found
+         | NotFound String   --identifier 
          | Ret Val
          | Brk
+         | Cnt
 
 instance Eq Val where
   (Intgr i)  == (Intgr j) = i == j
@@ -118,10 +95,11 @@ instance Show Val where
   show (Boolean b) = show b
   show None = "None"
   show (Ret v) = show v
-  show Void    = "Void"
+  show Void    = ""
+  show (Iterable t vals) = show vals
 
 type Env = M.HashMap String Val
-type EvalResult a = ContT a (StateT Env (ErrorT String IO)) a
+type EvalResult a = ContT Val (StateT Env (ErrorT String IO)) a
 
 envUpdate :: String -> Val -> Env -> Env
 envUpdate var val env = M.insert var val env
@@ -132,7 +110,10 @@ nameError name = "name " <> "' " <> name <> " '" <> " is not defined"
 makeErrorMsg :: String -> String -> String
 makeErrorMsg t err = t <> ": " <> err
 
+
 evalExpr :: Expression -> EvalResult Val
+evalExpr Null = return Void
+
 evalExpr (Name identifier) = do
   env <- lift get
   case M.lookup identifier env of
@@ -161,15 +142,15 @@ evalExpr (FunApp funName args) = do
             in lift $ throwError $ makeErrorMsg "TypeError" err
        else do
          vals <- mapM evalExpr args
-         traceM $ "the vals of args are: " <> show vals
+         --traceM $ "the vals of args are: " <> show vals
          let unpackedargs = Prelude.foldr evalArg [] args'
          defaults <- foldM evalDefaults M.empty args'
          let localEnv = (M.fromList (zip unpackedargs vals) `M.union`
                          defaults) `M.union` env
          lift $ put localEnv
          appVal <- evalStatements body
-         traceM "evaluation done"
-         traceM ("the value of " <> show funName <> " is: " <> show appVal)
+         --traceM "evaluation done"
+         --traceM ("the value of " <> show funName <> " is: " <> show appVal)
          lift $ put env
          return appVal
            where
@@ -215,6 +196,9 @@ evalExpr (Binop op left right) = do
        doBinop Add (Decimal l) (Intgr r) = return $ Decimal $ l + (fromInteger r)
        doBinop Add (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) + r
 
+       doBinop Add (Iterable lkind lvals) (Iterable rkind rvals)
+         | lkind == rkind = return $ Iterable lkind (lvals ++ rvals)
+         | otherwise = lift $ throwError $ makeErrorMsg "TypeError" "Cannot concatenate " <> lkind <> " and " <> rkind
        doBinop Sub (Intgr l) (Intgr r) = return $ Intgr $ l - r
        doBinop Sub (Decimal l) (Intgr r) = return $ Decimal $ l - (fromInteger r)
        doBinop Sub (Intgr l) (Decimal r) = return $ Decimal $ (fromInteger l) - r
@@ -234,11 +218,19 @@ evalExpr (Binop op left right) = do
        doBinop Ne l r = return $ Boolean $ l /= r
        
        doBinop Gt l r = return $ Boolean $ l > r
-       doBinop Lt l r = return $ Boolean $ l <= r
+       doBinop Lt l r = return $ Boolean $ l < r
        doBinop Le l r = return $ Boolean $ l <= r
        doBinop Ge l r = return $ Boolean $ l >= r
 
        doBinop o l r = lift $ throwError $ "TypeError: Unsupported operand types(s) for " <> show o <> ": " <> show l <> " and " <> show r
+
+evalExpr (List exprs) = do
+  vals <- traverse evalExpr exprs 
+  return $ Iterable "list" vals
+
+evalExpr (Tuple exprs) = do
+  vals <- traverse evalExpr exprs 
+  return $ Iterable "tuple" vals
 
 evalStatements :: Statements -> EvalResult Val
 evalStatements stmts = do
@@ -251,8 +243,9 @@ evalStatements stmts = do
                                 return res
   case results of
    (r@(Ret _) : []) -> return r
+   (b@(Brk) : [])  -> return b
+   (c@(Cnt) : []) -> return c
    _  -> return Void
-
 
   {--
   rest <- (dropWhile (not . shouldExit)) <$> mapM evalStatement stmts
@@ -262,14 +255,7 @@ evalStatements stmts = do
      traceM ("the value of  is: " <> show x)
      return x
 --}
-  where
-    extract (Ret val) = val
-    extract _         = Void
-    
-    shouldExit :: Val -> Bool
-    shouldExit (Ret _) = True
-    shouldExit Brk     = True
-    shouldExit _       = False
+
 
 evalStatement :: Statement -> EvalResult Val
 evalStatement (Assignment left right) = do
@@ -281,11 +267,6 @@ evalStatement (Assignment left right) = do
               lift $ put $ envUpdate name rval env
               return Void
    _       -> lift $ throwError "not defined!"
-   where
-     evalLeft :: Expression -> EvalResult Val
-     evalLeft (Name identifier) = return $ Id identifier
-     evalLeft _                 = lift $ throwError "Invalid left side of an assignment!"
-
 
 evalStatement (FunDef name args body) = do
   env <- lift get
@@ -296,6 +277,9 @@ evalStatement (FunDef name args body) = do
 evalStatement (Return expr) = do
   val <- evalExpr expr
   return $ Ret val
+
+evalStatement Break  = return Brk
+evalStatement Continue = return Cnt
   
 evalStatement (If ifTest stmtGroups) = case stmtGroups of
   [] -> lift $ throwError "Empty if!"
@@ -309,13 +293,77 @@ evalStatement (If ifTest stmtGroups) = case stmtGroups of
 evalStatement (Print expr) = do
   contents <- evalExpr expr
   case contents of
-   NotFound name -> lift $ throwError $ "NameError: name " <> name <> " is not defined!"
+   NotFound name -> lift $ throwError $ makeErrorMsg "NameError" name <> " is not defined!"
    _             -> do
                     liftIO $ print contents
                     return Void
-  
-program :: Statements
 
+  
+
+evalStatement (For iterator iterable body) = do
+  itr <- evalExpr iterator
+  itrbl <- evalExpr iterable
+  if not (isIterable itrbl)
+    then lift $ throwError $ makeErrorMsg "TypeError" (show itrbl) <> " object is not iterable"
+    else do
+         results <- callCC $ \exit -> do
+           forM (elements itrbl) $ \elemt -> do
+             bindings <- makeBindings itr elemt
+             env <- lift get
+             let localEnv = (fromList bindings) `M.union` env
+             lift $ put localEnv
+             res <- evalStatements body
+             lift $ put env
+             when (shouldBreak res) $ exit [res]
+             return res
+             
+         case results of
+          (r@(Ret _) : []) -> return r
+          _  -> return Void
+    
+  where
+    isIterable (Iterable _ _) = True
+    isIterable _              = False
+
+
+evalStatement w@(While predicate body) = do
+  p <- evalExpr predicate
+  case p of
+   Boolean False -> return Void
+   None -> return Void
+   _ -> do
+     res <- evalStatements body
+     case res of
+      r@(Ret _) -> return r
+      Brk -> return Void
+      _ -> evalStatement w
+
+evalLeft :: Expression -> EvalResult Val
+evalLeft (Name identifier) = return $ Id identifier
+evalLeft _                 = lift $ throwError "Invalid left value!"
+
+shouldExit :: Val -> Bool
+shouldExit (Ret _) = True
+shouldExit Brk     = True
+shouldExit Cnt    = True
+shouldExit _      = False
+
+shouldBreak :: Val -> Bool
+shouldBreak (Ret _) = True
+shouldBreak  Brk    = True
+shouldBreak  _      = False
+
+makeBindings :: Val -> Val -> EvalResult [(String, Val)]
+makeBindings (NotFound name) val = return [(name, val)]
+makeBindings (Id name) val = return [(name, val)]
+makeBindings (Iterable _ keys) (Iterable _ vals)
+  | (length keys) > (length vals) = lift $ throwError $ makeErrorMsg "ValueError" "too few values to unpack"
+  | (length keys) < (length vals) = lift $ throwError $ makeErrorMsg "ValueError" "too many values to unpack"
+  | otherwise = do
+      b <- traverse (uncurry makeBindings) (zip keys vals) 
+      return $ concat b
+makeBindings (Iterable _ _) v = lift $ throwError $ makeErrorMsg "TypeError" (show v) <> " object is not iterable"
+program :: Statements
 program = [FunDef "fib" [Identifier "n"]
                         [If (Binop Le (Name "n") (Number $ Integ 0))
                             [[Return $ Number $ Integ 1]],
@@ -333,29 +381,75 @@ program2 = [FunDef "test" [Identifier "n"]
                            Return $ Binop Add (Name "n") (FunApp "test" [Binop Sub (Name "n") (Number $ Integ 1)])],
  
             Print $ FunApp "test" [Number $ Integ 10]]
-
 {--
 
-program = [Assignment (Name "a") (Number $ Integ 5),
+for a, b in [(1, 2), (3, 4), (5, 6), (0, 8)]:
+ if a > 3:
+   continue
+ print a
+ print b * "*"
+ print "yayyy!"
 
-           Assignment (Name "b") (Number $ Flt 2.0),
-           If (Binop Eq (Name "a") (Name "b"))
-              [[Print $ StrLiteral "equal"],
-               [If (Binop Ge (Name "a") (Number $ Integ 2))
-                   [[Assignment (Name "c") (Binop Add (Name "a") (Name "b")),
-                     Print $ Name "c"],
-                    [If (Binop Eq (Name "b") (Number $ Flt 2.0))
-                       [[Assignment (Name "d") (Binop Div (Name "a") (Name "b")),
-                         Print $ Binop Sub (Name "d") (Name "a")],
-
-                        [Print $ StrLiteral "blah"]]]]]]]
 --}
---type EvalResult = ContT () (StateT Env (ErrorT String IO))
+program3 :: Statements
+program3 = [For (Tuple [Name "a", Name "b"])
+             (List [Tuple [Number $ Integ 1, Number $ Integ 2], Tuple [Number $ Integ 3, Number $ Integ 4], Tuple [Number $ Integ 5, Number $ Integ 6], Tuple [Number $ Integ 0, Number $ Integ 8]])
+             [If (Binop Gt (Name "a") (Number $ Integ 3))
+              [[Continue]],
+              Print $ Name "a",
+              Print $ Binop Mul (Name "b") (StrLiteral "*")],
+            Print $ StrLiteral "Yayyyy!"]
+
+
+{--
+for c in [1, 2, 4, 8]:
+  for a, b in [(1, 2), (3, 4), (5, 6), (7, 8)]:
+   if a > 3:
+    break
+   print a + c
+   print b * "*"
+
+--}
+program4 :: Statements
+program4 = [For (Name "c" ) (List [Number $ Integ 1, Number $ Integ 2, Number $ Integ 4, Number $ Integ 8])
+            [For (Tuple [Name "a", Name "b"])
+             (List [Tuple [Number $ Integ 1, Number $ Integ 2], Tuple [Number $ Integ 3, Number $ Integ 4], Tuple [Number $ Integ 5, Number $ Integ 6]])
+             [If (Binop Gt (Name "a") (Number $ Integ 3))
+              [[Break]],
+              Print $ Binop Add (Name "a")  (Name "c"),
+              Print $ Binop Mul (Name "b") (StrLiteral "*")]],
+            Print $ StrLiteral "Yayyyy!"]
+
+
+{--
+a = 2
+while a < 10 :
+  print a
+  if a == 2:
+    a = a + 4
+    continue
+  a = a + 1
+--}
+program5 :: Statements
+program5 = [Assignment (Name "a") (Number $ Integ 2),
+            While (Binop Lt (Name "a") (Number $ Integ 10))
+                  [If (Binop Eq (Name "a") (Number $ Integ 2))
+                   [[Assignment (Name "a") (Binop Add (Name "a") (Number $ Integ 4)),
+                     Continue]],
+                   Print $ Name "a",
+                   Assignment (Name "a") (Binop Add (Name "a") (Number $ Integ 2))],
+            Print $ StrLiteral "Done!"]
+                                   
+
 interpret :: Env -> EvalResult Val -> IO (Either String (Val, Env))
 interpret env res = runErrorT $ runStateT (runContT res return) env
 main = do
-  evalRes <- interpret M.empty (evalStatements program)
+  evalRes <- interpret M.empty (evalStatements program5)
   case evalRes of
    Right _ -> return ()
    Left err -> print err
-  
+
+  --bindings <- makeBindings (Id "a") (Iterable "Tuple" [Intgr 1, Intgr 2])
+  --print bindings
+     
+     
