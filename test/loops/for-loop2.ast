@@ -1,0 +1,9 @@
+program4 :: Statements
+program4 = [For (Name "c" ) (List [Number $ Integ 1, Number $ Integ 2, Number $ Integ 4, Number $ Integ 8])
+            [For (Tuple [Name "a", Name "b"])
+             (List [Tuple [Number $ Integ 1, Number $ Integ 2], Tuple [Number $ Integ 3, Number $ Integ 4], Tuple [Number $ Integ 5, Number $ Integ 6]])
+             [If (Binop Gt (Name "a") (Number $ Integ 3))
+              [[Break]],
+              Print $ Binop Add (Name "a")  (Name "c"),
+              Print $ Binop Mul (Name "b") (StrLiteral "*")]],
+            Print $ StrLiteral "Yayyyy!"]

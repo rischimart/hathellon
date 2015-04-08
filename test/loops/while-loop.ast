@@ -1,0 +1,9 @@
+program5 :: Statements
+program5 = [Assignment (Name "a") (Number $ Integ 2),
+            While (Binop Lt (Name "a") (Number $ Integ 10))
+                  [If (Binop Eq (Name "a") (Number $ Integ 2))
+                   [[Assignment (Name "a") (Binop Add (Name "a") (Number $ Integ 4)),
+                     Continue]],
+                   Print $ Name "a",
+                   Assignment (Name "a") (Binop Add (Name "a") (Number $ Integ 2))],
+            Print $ StrLiteral "Done!"]

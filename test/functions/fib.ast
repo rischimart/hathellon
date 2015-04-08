@@ -1,0 +1,9 @@
+program :: Statements
+program = [FunDef "fib" [Identifier "n"]
+                        [If (Binop Le (Name "n") (Number $ Integ 0))
+                            [[Return $ Number $ Integ 1]],
+                         If (Binop Eq (Name "n") (Number $ Integ 1))
+                            [[Return $ Number $ Integ 1]],
+                         Return $ Binop Add (FunApp "fib" [Binop Sub (Name "n") (Number $ Integ 2)]) (FunApp "fib" [Binop Sub (Name "n") (Number $ Integ 1)])],
+                         
+           Print $ FunApp "fib" [Number $ Integ 10]]
